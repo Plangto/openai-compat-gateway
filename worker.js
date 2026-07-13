@@ -108,6 +108,19 @@ const STRIP_HEADERS = [
   "x-forwarded-proto",
 ];
 
+// Fields some OpenAI clients send that many OpenAI-compatible origins
+// (e.g. NVIDIA NIM) reject with a 400 "Unsupported parameter(s)" error.
+// Override via the STRIP_PARAMS env var (comma-separated list), or set
+// STRIP_PARAMS to an empty string to disable stripping entirely and
+// restore full zero-parse passthrough.
+const DEFAULT_STRIP_PARAMS = ["promptCacheKey", "prompt_cache_key"];
+
+function getStripParams(env) {
+  if (env.STRIP_PARAMS === undefined) return DEFAULT_STRIP_PARAMS;
+  if (env.STRIP_PARAMS === "") return [];
+  return env.STRIP_PARAMS.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
@@ -150,12 +163,42 @@ export default {
     const method = request.method;
     const hasBody = method !== "GET" && method !== "HEAD";
 
+    let outBody = hasBody ? request.body : undefined;
+
+    const stripParams = hasBody ? getStripParams(env) : [];
+    if (stripParams.length > 0) {
+      const contentType = request.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const bodyText = await request.text();
+        if (bodyText) {
+          try {
+            const parsed = JSON.parse(bodyText);
+            let changed = false;
+            for (const p of stripParams) {
+              if (p in parsed) {
+                delete parsed[p];
+                changed = true;
+              }
+            }
+            outBody = changed ? JSON.stringify(parsed) : bodyText;
+          } catch (e) {
+            outBody = bodyText;
+          }
+          if (typeof outBody === "string") {
+            outHeaders.set("content-length", String(new TextEncoder().encode(outBody).length));
+          }
+        } else {
+          outBody = bodyText;
+        }
+      }
+    }
+
     const originResponse = await fetch(targetUrl, {
       method,
       headers: outHeaders,
-      body: hasBody ? request.body : undefined,
+      body: outBody,
       // @ts-ignore
-      duplex: hasBody ? "half" : undefined,
+      duplex: hasBody && outBody instanceof ReadableStream ? "half" : undefined,
     });
 
     const respHeaders = applyCors(new Headers(originResponse.headers));

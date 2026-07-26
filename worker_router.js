@@ -1,4 +1,3 @@
-
 const ROUTES = [
   ["POST", /^\/v1\/chat\/completions$/],
   ["POST", /^\/v1\/completions$/],
@@ -153,7 +152,8 @@ function buildAttemptModelIds(provider, clientModel) {
 }
 
 function targetPathFor(baseUrl, pathname) {
-  return baseUrl.endsWith("/v1") && pathname.startsWith("/v1") ? pathname.slice(3) : pathname;
+  const baseAlreadyVersioned = /\/v1$/i.test(baseUrl) || /\/openai$/i.test(baseUrl);
+  return baseAlreadyVersioned && pathname.startsWith("/v1") ? pathname.slice(3) : pathname;
 }
 
 const REASONING_MODEL_PATTERN =

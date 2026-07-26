@@ -1,3 +1,4 @@
+
 const ROUTES = [
   ["POST", /^\/v1\/chat\/completions$/],
   ["POST", /^\/v1\/completions$/],
@@ -199,6 +200,182 @@ function applyAutoThinking(clone, provider, modelId) {
   return { ...clone, ...extra };
 }
 
+function isGeminiNativeBase(baseUrl) {
+  return /generativelanguage\.googleapis\.com/i.test(baseUrl) && !/\/openai\/?$/i.test(baseUrl);
+}
+
+const GEMINI_NATIVE_SUPPORTED_ROUTES = [/^\/v1\/chat\/completions$/];
+
+function openAIContentToGeminiParts(content) {
+  if (typeof content === "string") return [{ text: content }];
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue;
+      if (part.type === "text" && typeof part.text === "string") {
+        parts.push({ text: part.text });
+      } else if (
+        part.type === "image_url" &&
+        part.image_url &&
+        typeof part.image_url.url === "string"
+      ) {
+        const m = /^data:([^;]+);base64,(.+)$/.exec(part.image_url.url);
+        if (m) {
+          parts.push({ inlineData: { mimeType: m[1], data: m[2] } });
+        }
+        // Remote http(s) image URLs aren't fetched/inlined in this version — unsupported, dropped.
+      }
+    }
+    return parts.length > 0 ? parts : [{ text: "" }];
+  }
+  return [{ text: String(content == null ? "" : content) }];
+}
+
+function buildGeminiRequestBody(openAiBody) {
+  const messages = Array.isArray(openAiBody.messages) ? openAiBody.messages : [];
+  const systemTexts = [];
+  const contents = [];
+
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") continue;
+    if (msg.role === "system" || msg.role === "developer") {
+      for (const p of openAIContentToGeminiParts(msg.content)) {
+        if (p.text) systemTexts.push(p.text);
+      }
+      continue;
+    }
+    if (msg.role === "tool" || msg.role === "function") {
+      // Tool/function call results aren't translated in this version — dropped rather than
+      // sent malformed. Plain text-only chat is fully supported.
+      continue;
+    }
+    const role = msg.role === "assistant" ? "model" : "user";
+    contents.push({ role, parts: openAIContentToGeminiParts(msg.content) });
+  }
+
+  const generationConfig = {};
+  if (typeof openAiBody.temperature === "number") generationConfig.temperature = openAiBody.temperature;
+  if (typeof openAiBody.top_p === "number") generationConfig.topP = openAiBody.top_p;
+  const maxTokens = openAiBody.max_tokens ?? openAiBody.max_completion_tokens;
+  if (typeof maxTokens === "number") generationConfig.maxOutputTokens = maxTokens;
+  if (openAiBody.stop) {
+    generationConfig.stopSequences = Array.isArray(openAiBody.stop) ? openAiBody.stop : [openAiBody.stop];
+  }
+  if (typeof openAiBody.n === "number") generationConfig.candidateCount = openAiBody.n;
+
+  const body = { contents };
+  if (systemTexts.length > 0) body.systemInstruction = { parts: [{ text: systemTexts.join("\n\n") }] };
+  if (Object.keys(generationConfig).length > 0) body.generationConfig = generationConfig;
+  return body;
+}
+
+function geminiFinishReasonToOpenAI(reason) {
+  switch (reason) {
+    case "STOP":
+      return "stop";
+    case "MAX_TOKENS":
+      return "length";
+    case "SAFETY":
+    case "RECITATION":
+    case "BLOCKLIST":
+    case "PROHIBITED_CONTENT":
+      return "content_filter";
+    default:
+      return "stop";
+  }
+}
+
+function newChatId() {
+  const rand = crypto.randomUUID ? crypto.randomUUID().replace(/-/g, "") : String(Date.now());
+  return "chatcmpl-" + rand;
+}
+
+function geminiResponseToOpenAI(geminiJson, modelId) {
+  const candidate = (geminiJson.candidates && geminiJson.candidates[0]) || {};
+  const text = ((candidate.content && candidate.content.parts) || [])
+    .map((p) => p.text || "")
+    .join("");
+  const usage = geminiJson.usageMetadata || {};
+  return {
+    id: newChatId(),
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: modelId,
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: text },
+        finish_reason: geminiFinishReasonToOpenAI(candidate.finishReason),
+      },
+    ],
+    usage: {
+      prompt_tokens: usage.promptTokenCount || 0,
+      completion_tokens: usage.candidatesTokenCount || 0,
+      total_tokens: usage.totalTokenCount || 0,
+    },
+  };
+}
+
+function createGeminiToOpenAIStreamTransformer(modelId) {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = "";
+  const chatId = newChatId();
+  const created = Math.floor(Date.now() / 1000);
+
+  function wrapChunk(deltaText, finishReason) {
+    const obj = {
+      id: chatId,
+      object: "chat.completion.chunk",
+      created,
+      model: modelId,
+      choices: [
+        {
+          index: 0,
+          delta: finishReason ? {} : { content: deltaText },
+          finish_reason: finishReason || null,
+        },
+      ],
+    };
+    return encoder.encode(`data: ${JSON.stringify(obj)}\n\n`);
+  }
+
+  return new TransformStream({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const rawEvent = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const dataStr = rawEvent
+          .split("\n")
+          .filter((l) => l.startsWith("data:"))
+          .map((l) => l.slice(5).trim())
+          .join("");
+        if (!dataStr || dataStr === "[DONE]") continue;
+        let parsed;
+        try {
+          parsed = JSON.parse(dataStr);
+        } catch (e) {
+          continue;
+        }
+        const candidate = (parsed.candidates && parsed.candidates[0]) || null;
+        if (!candidate) continue;
+        const text = ((candidate.content && candidate.content.parts) || [])
+          .map((p) => p.text || "")
+          .join("");
+        if (text) controller.enqueue(wrapChunk(text, null));
+        if (candidate.finishReason) {
+          controller.enqueue(wrapChunk("", geminiFinishReasonToOpenAI(candidate.finishReason)));
+        }
+      }
+    },
+    flush(controller) {
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+    },
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
@@ -311,6 +488,62 @@ export default {
     const timeoutMs = Number(env.PROVIDER_TIMEOUT_MS) > 0 ? Number(env.PROVIDER_TIMEOUT_MS) : 20000;
 
     async function attempt(provider, modelId) {
+      if (isGeminiNativeBase(provider.baseUrl) && bodyKind === "json") {
+        if (
+          method !== "POST" ||
+          !GEMINI_NATIVE_SUPPORTED_ROUTES.some((re) => re.test(incoming.pathname))
+        ) {
+          return {
+            ok: false,
+            error: new Error(
+              "This endpoint isn't supported for a native Gemini (generateContent) provider — only /v1/chat/completions is translated"
+            ),
+          };
+        }
+
+        const wantsStream = jsonBody && jsonBody.stream === true;
+        const action = wantsStream ? "streamGenerateContent" : "generateContent";
+        const suffix = wantsStream ? "?alt=sse" : "";
+        const targetUrl = `${provider.baseUrl}/models/${encodeURIComponent(modelId)}:${action}${suffix}`;
+        const geminiBody = buildGeminiRequestBody(jsonBody || {});
+
+        const headers = new Headers(baseHeaders);
+        headers.delete("Authorization");
+        headers.set("x-goog-api-key", provider.apiKey);
+        headers.set("content-type", "application/json");
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const resp = await fetch(targetUrl, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(geminiBody),
+            signal: controller.signal,
+          });
+          clearTimeout(timer);
+          if (!resp.ok) return { ok: false, resp };
+
+          if (wantsStream) {
+            const transformed = resp.body.pipeThrough(createGeminiToOpenAIStreamTransformer(modelId));
+            const respHeaders = applyCors(new Headers());
+            respHeaders.set("content-type", "text/event-stream; charset=utf-8");
+            respHeaders.set("cache-control", "no-cache");
+            return {
+              ok: true,
+              translatedResponse: new Response(transformed, { status: 200, headers: respHeaders }),
+            };
+          }
+
+          const geminiJson = await resp.json();
+          const openaiJson = geminiResponseToOpenAI(geminiJson, modelId);
+          return { ok: true, translatedResponse: json(openaiJson, 200) };
+        } catch (err) {
+          clearTimeout(timer);
+          return { ok: false, error: err };
+        }
+      }
+
       const path = targetPathFor(provider.baseUrl, incoming.pathname);
       const targetUrl = provider.baseUrl + path + incoming.search;
 
@@ -355,6 +588,9 @@ export default {
         const result = await attempt(provider, modelId);
 
         if (result.ok) {
+          if (result.translatedResponse) {
+            return result.translatedResponse;
+          }
           const resp = result.resp;
           const respHeaders = applyCors(new Headers(resp.headers));
           respHeaders.delete("content-security-policy");

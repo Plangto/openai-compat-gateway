@@ -102,6 +102,76 @@ images, audio, etc.). For endpoints without one (e.g. `GET /v1/models`,
 `DELETE /v1/files/{id}`), the worker just tries each provider once, in
 order, ignoring the model spec.
 
+### Google AI Studio (Gemini)
+
+Google's Gemini API has an official OpenAI-compatible endpoint at
+`https://generativelanguage.googleapis.com/v1beta/openai` — note that
+`v1beta` here is just the (currently only) path Google publishes for this
+feature, not a warning sign; it works the same as any other
+OpenAI-compatible base URL. Drop it straight into `PROVIDERS` using your
+Gemini API key (from AI Studio) as the API key field:
+
+```
+https://generativelanguage.googleapis.com/v1beta/openai;YOUR_GEMINI_API_KEY;req+gemini-2.5-flash
+```
+
+Any base URL ending in `/v1` **or** `/openai` is treated as an
+already-versioned root, so the worker correctly strips the client's own
+leading `/v1` before appending the rest of the path — avoiding a broken
+double-`/v1` request against Google's endpoint.
+
+### Google AI Studio — native `generateContent` (no `/openai` shim)
+
+If instead you want to hit Gemini's own native API directly —
+`https://generativelanguage.googleapis.com/v1beta/models/MODEL:generateContent`
+— rather than the OpenAI-compat shim, that's also supported. Just point a
+provider's base URL at Google's native root, **without** the `/openai`
+suffix:
+
+```
+https://generativelanguage.googleapis.com/v1beta;YOUR_GEMINI_API_KEY;req+gemini-2.5-flash
+```
+
+The worker detects this automatically (any base URL on
+`generativelanguage.googleapis.com` that doesn't end in `/openai`) and
+translates in both directions:
+
+- **Request**: your client's normal OpenAI-shaped `POST /v1/chat/completions`
+  body (`messages`, `temperature`, `top_p`, `max_tokens`, `stop`, `n`,
+  `stream`) is translated into Gemini's native `generateContent` request
+  shape (`contents`, `systemInstruction`, `generationConfig`) and sent to
+  `{baseUrl}/models/{model}:generateContent`, authenticated with an
+  `x-goog-api-key` header instead of a Bearer token.
+- **Response**: Gemini's native response is translated back into a normal
+  OpenAI `chat.completion` object, so your client sees exactly what it
+  would from any other OpenAI-compatible provider.
+- **Streaming**: if the client sends `"stream": true`, the worker calls
+  `:streamGenerateContent?alt=sse` and translates Gemini's SSE stream into
+  OpenAI-style `chat.completion.chunk` SSE events (with a final `[DONE]`),
+  in real time — not buffered.
+
+**Current limitations of this translation** (the OpenAI-compat `/openai`
+shim above doesn't have these limits, since Google maintains that
+translation itself):
+- Only `POST /v1/chat/completions` is translated. Any other route (models
+  list, embeddings, images, audio, etc.) against a native-Gemini provider
+  is treated as unsupported and immediately fails over to the next
+  provider/model in the chain.
+- Only text and base64 data-URL images (`data:image/...;base64,...`) in
+  message content are translated. Plain `http(s)` image URLs aren't
+  fetched/inlined, and tool/function-calling messages (`role: "tool"` /
+  `"function"`) are dropped rather than translated — a request with a
+  tool-call history will lose those turns rather than fail outright.
+- [Auto-thinking](#auto-thinking) doesn't apply to native-Gemini providers
+  yet (it's an OpenAI-field heuristic); Gemini's own `thinkingConfig` isn't
+  auto-injected here.
+
+For anything beyond plain text chat, the `/openai` compatibility shim
+covered in the section above is the safer, more complete choice — use
+native `generateContent` mainly if you specifically want to bypass
+Google's shim (e.g. it doesn't yet support a Gemini feature you need at
+the wire-protocol level).
+
 ## Auto-thinking
 
 Some models support an extended "thinking"/"reasoning" mode, but every
